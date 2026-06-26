@@ -7,6 +7,7 @@ import {
   AppState,
   Platform,
   Alert,
+  PermissionsAndroid,
 } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -142,6 +143,28 @@ export default function App() {
         "Power Build Required",
         "SMS inbox scan requires custom native module compilation. Please run 'npm run android' to boot."
       );
+      return;
+    }
+
+    try {
+      const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_SMS);
+      if (!hasPermission) {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_SMS,
+          {
+            title: "SMS Read Permission Required",
+            message: "Vault requires SMS read permission to automatically scan M-Pesa transaction receipts.",
+            buttonPositive: "Grant",
+            buttonNegative: "Deny",
+          }
+        );
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          Alert.alert("Permission Denied", "SMS synchronization cannot run without SMS read permissions.");
+          return;
+        }
+      }
+    } catch (err) {
+      Alert.alert("Permission Error", "Failed to check or request SMS permission: " + err.message);
       return;
     }
 
