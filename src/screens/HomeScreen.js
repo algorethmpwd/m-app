@@ -371,6 +371,7 @@ IMPORTANT: Do not return any markdown code block wrap (such as \`\`\`json) or an
             <Text style={[styles.breakdownValue, fulizaBalance > 0 ? { color: colors.statusExpense } : {}]}>
               {formatAmount(fulizaBalance)}
             </Text>
+          </View>
         </View>
 
         {/* Overdraft Warning Banner */}
