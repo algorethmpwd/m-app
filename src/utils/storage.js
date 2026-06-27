@@ -125,6 +125,19 @@ export const storage = {
   deletePin: async () => {
     await SecureStore.deleteItemAsync(PIN_KEY);
   },
+  getGeminiKey: async () => {
+    try {
+      return await SecureStore.getItemAsync("gemini_api_key");
+    } catch {
+      return null;
+    }
+  },
+  saveGeminiKey: async (key) => {
+    await SecureStore.setItemAsync("gemini_api_key", key);
+  },
+  deleteGeminiKey: async () => {
+    await SecureStore.deleteItemAsync("gemini_api_key");
+  },
 
   // Onboarding Complete flag
   getOnboardingComplete: async () => {

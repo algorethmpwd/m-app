@@ -30,6 +30,7 @@ import HomeScreen from "./src/screens/HomeScreen";
 import InsightsScreen from "./src/screens/InsightsScreen";
 import ReviewScreen from "./src/screens/ReviewScreen";
 import SettingsScreen from "./src/screens/SettingsScreen";
+import AiScreen from "./src/screens/AiScreen";
 
 // Native SMS Module Bridge
 import { NativeModules } from "react-native";
@@ -516,6 +517,12 @@ export default function App() {
             onDiscardItem={handleDiscardReviewItem}
           />
         )}
+        {activeTab === "AI" && (
+          <AiScreen
+            transactions={transactions}
+            budgets={budgets}
+          />
+        )}
         {activeTab === "Settings" && (
           <SettingsScreen
             transactions={transactions}
@@ -570,6 +577,25 @@ export default function App() {
             ]}
           >
             Insights
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.tabItem}
+          onPress={() => setActiveTab("AI")}
+        >
+          <Ionicons
+            name={activeTab === "AI" ? "sparkles" : "sparkles-outline"}
+            size={22}
+            color={activeTab === "AI" ? colors.accentPrimary : colors.textMuted}
+          />
+          <Text
+            style={[
+              styles.tabLabel,
+              { color: activeTab === "AI" ? colors.accentPrimary : colors.textMuted },
+            ]}
+          >
+            AI
           </Text>
         </TouchableOpacity>
 
