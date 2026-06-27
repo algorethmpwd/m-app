@@ -8,6 +8,7 @@ import {
   Platform,
   Alert,
   PermissionsAndroid,
+  Modal,
 } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
@@ -61,6 +62,30 @@ export default function App() {
   const [reminderTime, setReminderTime] = useState({ hour: 20, minute: 0 });
   const [pin, setPin] = useState(null);
 
+  const [customAlert, setCustomAlert] = useState({
+    visible: false,
+    title: "",
+    message: "",
+    buttons: [],
+  });
+
+  useEffect(() => {
+    Alert.alert = (title, message, buttons = []) => {
+      const formattedButtons = buttons.map((btn) => ({
+        text: btn.text || "OK",
+        onPress: btn.onPress,
+        style: btn.style,
+      }));
+
+      setCustomAlert({
+        visible: true,
+        title: title || "Alert",
+        message: message || "",
+        buttons: formattedButtons.length > 0 ? formattedButtons : [{ text: "OK", onPress: () => {} }],
+      });
+    };
+  }, []);
+
   // AppState monitoring for background lock
   const appState = useRef(AppState.currentState);
 
@@ -110,10 +135,39 @@ export default function App() {
       });
 
       let updatedTxs = [...currentTransactions];
-      if (parsedTxs.length > 0) {
-        updatedTxs = [...parsedTxs, ...currentTransactions];
-        setTransactions(updatedTxs);
-        await storage.saveTransactions(updatedTxs);
+      const newImportedTxs = [];
+
+      parsedTxs.forEach((parsed) => {
+        const exists = updatedTxs.some((t) => t.id === parsed.id);
+        if (exists) return;
+
+        const manualMatchIndex = updatedTxs.findIndex((t) => {
+          const isManual = t.source !== "sms";
+          const sameAmount = Math.abs(t.amount - parsed.amount) < 0.01;
+          const sameDateWindow = Math.abs(t.date - parsed.date) < 2 * 60 * 60 * 1000;
+          return isManual && sameAmount && sameDateWindow;
+        });
+
+        if (manualMatchIndex !== -1) {
+          updatedTxs[manualMatchIndex] = {
+            ...updatedTxs[manualMatchIndex],
+            id: parsed.id,
+            title: parsed.title,
+            icon: parsed.icon,
+            source: "sms",
+            mpesaBalance: parsed.mpesaBalance,
+            ziidiBalance: parsed.ziidiBalance,
+            fulizaBalance: parsed.fulizaBalance,
+          };
+        } else {
+          newImportedTxs.push(parsed);
+        }
+      });
+
+      if (newImportedTxs.length > 0 || updatedTxs.length !== currentTransactions.length) {
+        const finalMerged = [...newImportedTxs, ...updatedTxs];
+        setTransactions(finalMerged);
+        await storage.saveTransactions(finalMerged);
       }
 
       if (reviewItems.length > 0) {
@@ -336,27 +390,55 @@ export default function App() {
         }
       });
 
-      // Filter out duplicate transactions
-      const existingTxIds = new Set(transactions.map((t) => t.id));
-      const newTxs = parsedTxs.filter((t) => !existingTxIds.has(t.id));
+      // Reconcile manual entries and import new transactions
+      let updatedTxs = [...transactions];
+      const newImportedTxs = [];
+
+      parsedTxs.forEach((parsed) => {
+        const exists = updatedTxs.some((t) => t.id === parsed.id);
+        if (exists) return;
+
+        const manualMatchIndex = updatedTxs.findIndex((t) => {
+          const isManual = t.source !== "sms";
+          const sameAmount = Math.abs(t.amount - parsed.amount) < 0.01;
+          const sameDateWindow = Math.abs(t.date - parsed.date) < 2 * 60 * 60 * 1000;
+          return isManual && sameAmount && sameDateWindow;
+        });
+
+        if (manualMatchIndex !== -1) {
+          updatedTxs[manualMatchIndex] = {
+            ...updatedTxs[manualMatchIndex],
+            id: parsed.id,
+            title: parsed.title,
+            icon: parsed.icon,
+            source: "sms",
+            mpesaBalance: parsed.mpesaBalance,
+            ziidiBalance: parsed.ziidiBalance,
+            fulizaBalance: parsed.fulizaBalance,
+          };
+        } else {
+          newImportedTxs.push(parsed);
+        }
+      });
 
       // Filter out duplicate review SMS
       const existingReviewIds = new Set(reviewQueue.map((r) => r.id));
       const newReviews = reviewItems.filter((r) => !existingReviewIds.has(r.id));
 
-      if (newTxs.length > 0 || newReviews.length > 0) {
-        const updatedTxs = [...newTxs, ...transactions];
+      if (newImportedTxs.length > 0 || newReviews.length > 0 || updatedTxs.length !== transactions.length) {
+        const finalMerged = [...newImportedTxs, ...updatedTxs];
         const updatedReview = [...newReviews, ...reviewQueue];
         
-        setTransactions(updatedTxs);
+        setTransactions(finalMerged);
         setReviewQueue(updatedReview);
         
-        await storage.saveTransactions(updatedTxs);
+        await storage.saveTransactions(finalMerged);
         await storage.saveReviewQueue(updatedReview);
 
+        const reconciledCount = transactions.length - updatedTxs.filter((t) => t.source !== "sms").length;
         Alert.alert(
           "Sync Complete",
-          `Imported ${newTxs.length} new transactions. Added ${newReviews.length} items to Review Queue.`
+          `Imported ${newImportedTxs.length} new transactions. Added ${newReviews.length} items to Review.`
         );
       } else {
         Alert.alert("Sync Complete", "All transactions in your SMS logs are already imported!");
@@ -521,6 +603,19 @@ export default function App() {
           <AiScreen
             transactions={transactions}
             budgets={budgets}
+            reviewQueue={reviewQueue}
+            onUpdateTransactions={async (newTxs) => {
+              setTransactions(newTxs);
+              await storage.saveTransactions(newTxs);
+            }}
+            onUpdateReviewQueue={async (newQueue) => {
+              setReviewQueue(newQueue);
+              await storage.saveReviewQueue(newQueue);
+            }}
+            onUpdateBudgets={async (newBudgets) => {
+              setBudgets(newBudgets);
+              await storage.saveBudgets(newBudgets);
+            }}
           />
         )}
         {activeTab === "Settings" && (
@@ -643,6 +738,56 @@ export default function App() {
           </Text>
         </TouchableOpacity>
       </View>
+
+      {/* Custom Animated Popup Overlay */}
+      <Modal
+        visible={customAlert.visible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setCustomAlert({ ...customAlert, visible: false })}
+      >
+        <View style={styles.alertOverlay}>
+          <View style={styles.alertContainer}>
+            <View style={styles.alertHeader}>
+              <Ionicons name="sparkles-outline" size={20} color={colors.accentGold} />
+              <Text style={styles.alertTitle}>{customAlert.title}</Text>
+            </View>
+            <Text style={styles.alertMessage}>{customAlert.message}</Text>
+            <View style={styles.alertButtons}>
+              {customAlert.buttons.map((btn, index) => {
+                const isDestructive = btn.style === "destructive";
+                const isCancel = btn.style === "cancel";
+                
+                return (
+                  <TouchableOpacity
+                    key={index}
+                    style={[
+                      styles.alertButton,
+                      isDestructive && styles.alertButtonDestructive,
+                      isCancel && styles.alertButtonCancel,
+                      customAlert.buttons.length > 1 && { flex: 1, marginHorizontal: 4 },
+                    ]}
+                    onPress={() => {
+                      setCustomAlert(prev => ({ ...prev, visible: false }));
+                      if (btn.onPress) btn.onPress();
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.alertButtonText,
+                        isDestructive && styles.alertButtonTextDestructive,
+                        isCancel && styles.alertButtonTextCancel,
+                      ]}
+                    >
+                      {btn.text}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaProvider>
   );
 }
@@ -694,5 +839,73 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: colors.statusExpense, // red/clay warning dot
+  },
+  alertOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24,
+  },
+  alertContainer: {
+    backgroundColor: colors.bgElevated,
+    borderWidth: 1,
+    borderColor: colors.borderHairline,
+    borderRadius: 12,
+    padding: 20,
+    width: "100%",
+    maxWidth: 320,
+  },
+  alertHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 10,
+  },
+  alertTitle: {
+    fontFamily: "BebasNeue_400Regular",
+    fontSize: 18,
+    color: colors.accentGold,
+    letterSpacing: 0.5,
+    marginLeft: 8,
+  },
+  alertMessage: {
+    fontFamily: "Nunito_400Regular",
+    fontSize: 13,
+    color: colors.textPrimary,
+    lineHeight: 18,
+    marginBottom: 20,
+  },
+  alertButtons: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  alertButton: {
+    backgroundColor: colors.accentPrimary,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: 80,
+  },
+  alertButtonText: {
+    color: colors.bgBase,
+    fontFamily: "Nunito_700Bold",
+    fontSize: 13,
+  },
+  alertButtonDestructive: {
+    backgroundColor: colors.statusExpense,
+  },
+  alertButtonTextDestructive: {
+    color: colors.textPrimary,
+  },
+  alertButtonCancel: {
+    backgroundColor: colors.bgElevated,
+    borderWidth: 1,
+    borderColor: colors.borderHairline,
+  },
+  alertButtonTextCancel: {
+    color: colors.textMuted,
+    fontFamily: "Nunito_600SemiBold",
   },
 });

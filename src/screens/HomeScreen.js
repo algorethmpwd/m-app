@@ -12,12 +12,20 @@ import {
   Platform,
   Linking,
   Share,
+  ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { colors } from "../theme/colors";
 import { parseMpesaSms } from "../utils/parser";
 import { classifyTransaction } from "../utils/classifier";
+import { storage } from "../utils/storage";
+import {
+  detectRecurringBills,
+  predictOverdraft,
+  buildUtilityDirectory,
+  calculateDailyBurnRate,
+} from "../utils/financeUtils";
 
 const AVAILABLE_ICONS = [
   "cart-outline",
@@ -46,6 +54,7 @@ export default function HomeScreen({
   const [modalVisible, setModalVisible] = useState(false);
   const [pasteModalVisible, setPasteModalVisible] = useState(false);
   const [pastedSms, setPastedSms] = useState("");
+  const [aiParsing, setAiParsing] = useState(false);
   
   const [newTitle, setNewTitle] = useState("");
   const [newAmount, setNewAmount] = useState("");
@@ -64,19 +73,32 @@ export default function HomeScreen({
     .filter((t) => t.amount < 0)
     .reduce((sum, t) => sum + Math.abs(t.amount), 0);
 
-  const totalBalance = totalIncome - totalExpenses;
+  // Latest parsed actual balances from Safaricom / Bank SMS messages
+  const latestMpesaTx = transactions.find((t) => t.mpesaBalance !== undefined);
+  const latestZiidiTx = transactions.find((t) => t.ziidiBalance !== undefined);
+  const latestFulizaTx = transactions.find((t) => t.fulizaBalance !== undefined);
 
-  // 1. Calculate Ziidi Balance (savings MMF)
-  const ziidiBalance = transactions
+  // Fallbacks: if no SMS transaction has the actual balance, calculate historically
+  const mpesaCashFallback = totalIncome - totalExpenses;
+  const ziidiFallback = transactions
     .filter((t) => t.isSavings || (t.title && t.title.toLowerCase().includes("ziidi")))
     .reduce((sum, t) => sum - t.amount, 0);
 
-  // 2. Calculate Fuliza Outstanding Debt
-  const latestFulizaTx = transactions.find((t) => t.fulizaBalance !== undefined);
+  const mpesaCashBalance = latestMpesaTx ? latestMpesaTx.mpesaBalance : mpesaCashFallback;
+  const ziidiBalance = latestZiidiTx ? latestZiidiTx.ziidiBalance : ziidiFallback;
   const fulizaBalance = latestFulizaTx ? latestFulizaTx.fulizaBalance : 0;
 
-  // 3. Calculate Net Available Balance
-  const netBalance = totalBalance + ziidiBalance - fulizaBalance;
+  // Map totalBalance to mpesaCashBalance for UI rendering
+  const totalBalance = mpesaCashBalance;
+
+  // Net Available Balance
+  const netBalance = mpesaCashBalance + ziidiBalance - fulizaBalance;
+
+  // Analytics calculations
+  const recurringBills = detectRecurringBills(transactions);
+  const dailyBurnRate = calculateDailyBurnRate(transactions);
+  const overdraftForecast = predictOverdraft(mpesaCashBalance, recurringBills, dailyBurnRate);
+  const utilityDirectory = buildUtilityDirectory(transactions);
 
   // Format currency helpers (handles negative numbers correctly)
   const formatAmount = (value, showSign = false) => {
@@ -134,31 +156,15 @@ export default function HomeScreen({
   };
 
   // Paste message parser trigger
-  const handlePasteParse = () => {
+  const handlePasteParse = async () => {
     if (!pastedSms.trim()) {
-      Alert.alert("Empty", "Please paste an M-Pesa SMS message.");
+      Alert.alert("Empty", "Please paste an M-Pesa SMS message or write a transaction description.");
       return;
     }
 
     const { confidence, parsed } = parseMpesaSms(pastedSms.trim(), "M_" + Date.now());
 
-    if (confidence === "none" || !parsed) {
-      // Direct message routing to Review queue
-      onAddReviewItem({
-        id: "R_" + Date.now(),
-        body: pastedSms.trim(),
-        date: Date.now(),
-      });
-      Alert.alert(
-        "Low Confidence / Parse Failure",
-        "Could not auto-parse this message. It has been routed to the Review Tab.",
-        [
-          { text: "Close" },
-          { text: "Go to Review", onPress: () => onNavigateToTab("Review") },
-        ]
-      );
-    } else {
-      // Success adding transaction
+    if (confidence === "high" && parsed) {
       if (parsed.amount < 0) {
         const mlIcon = classifyTransaction(parsed.title, transactions);
         if (mlIcon) {
@@ -166,11 +172,83 @@ export default function HomeScreen({
         }
       }
       onAddTransaction(parsed);
+      setPastedSms("");
+      setPasteModalVisible(false);
       Alert.alert("Success", `Parsed: ${parsed.title} for Ksh ${Math.abs(parsed.amount)}`);
-    }
+    } else {
+      // Standard regex failed. Cascade to AI Natural Language extraction!
+      const apiKey = await storage.getGeminiKey();
+      if (!apiKey) {
+        // Fallback: put in review queue if no API key is linked
+        onAddReviewItem({
+          id: "R_" + Date.now(),
+          body: pastedSms.trim(),
+          date: Date.now(),
+        });
+        Alert.alert(
+          "Review Queue",
+          "Standard receipt format not recognized. Message sent to Review tab. Link your Gemini API key in the AI Tab to enable instant AI parsing."
+        );
+        setPastedSms("");
+        setPasteModalVisible(false);
+        return;
+      }
 
-    setPastedSms("");
-    setPasteModalVisible(false);
+      setAiParsing(true);
+      try {
+        const prompt = `You are a financial statement parsing engine. Read this natural language statement and extract transaction details:
+"${pastedSms}"
+
+Return ONLY a valid JSON object with the following structure:
+{
+  "title": "Cleaned name of merchant/place/person (max 25 characters)",
+  "amount": number (positive for income/deposits, negative for expenses/withdrawals),
+  "category": "icon-name (one of 'cart-outline', 'home-outline', 'logo-youtube', 'restaurant-outline', 'car-outline', 'gift-outline', 'send', 'wallet', 'trending-up-outline', 'swap-horizontal')"
+}
+
+IMPORTANT: Do not return any markdown code block wrap (such as \`\`\`json) or any comments. Just the raw JSON string starting with { and ending with }.`;
+
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+            }),
+          }
+        );
+
+        const json = await response.json();
+        const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        let clean = rawText.trim();
+        if (clean.startsWith("```")) {
+          clean = clean.replace(/^```[a-z]*\n/i, "").replace(/\n```$/i, "").trim();
+        }
+
+        const aiParsed = JSON.parse(clean);
+        if (aiParsed && aiParsed.title && typeof aiParsed.amount === "number") {
+          const newTx = {
+            id: "M_AI_" + Date.now(),
+            title: aiParsed.title,
+            amount: aiParsed.amount,
+            icon: aiParsed.category || "swap-horizontal",
+            date: Date.now(),
+            source: "manual",
+          };
+          onAddTransaction(newTx);
+          setPastedSms("");
+          setPasteModalVisible(false);
+          Alert.alert("AI Extraction Complete", `Auto-detected: ${newTx.title} for Ksh ${Math.abs(newTx.amount)}`);
+        } else {
+          Alert.alert("AI Extraction Error", "AI scanned the input but could not extract structured transaction details.");
+        }
+      } catch (err) {
+        Alert.alert("AI Extraction Failed", err.message);
+      } finally {
+        setAiParsing(false);
+      }
+    }
   };
 
   const openQuickManualAdd = (type) => {
@@ -293,8 +371,17 @@ export default function HomeScreen({
             <Text style={[styles.breakdownValue, fulizaBalance > 0 ? { color: colors.statusExpense } : {}]}>
               {formatAmount(fulizaBalance)}
             </Text>
-          </View>
         </View>
+
+        {/* Overdraft Warning Banner */}
+        {overdraftForecast.willOverdraft && (
+          <View style={styles.overdraftBanner}>
+            <Ionicons name="alert-circle" size={18} color={colors.statusExpense} style={{ marginRight: 8 }} />
+            <Text style={styles.overdraftBannerText}>
+              Fuliza Warning: Your M-Pesa balance is predicted to trigger a Fuliza overdraft on {overdraftForecast.overdraftDate} due to upcoming recurring bills.
+            </Text>
+          </View>
+        )}
 
         {/* Dynamic Needs Review Warning Banner */}
         {reviewQueue.length > 0 && (
@@ -313,36 +400,104 @@ export default function HomeScreen({
         )}
 
         {/* Quick Actions */}
-        <Text style={styles.sectionTitle}>Quick Actions</Text>
-        <View style={styles.actionsRow}>
+        <Text style={styles.sectionTitle}>Statement Import Actions</Text>
+        <View style={styles.importActionsContainer}>
           <TouchableOpacity
-            style={styles.actionButton}
-            onPress={() => openQuickManualAdd("expense")}
+            style={styles.primaryImportButton}
+            onPress={handleSyncPress}
           >
-            <Ionicons name="arrow-up" size={22} color={colors.statusExpense} />
-            <Text style={styles.actionText}>Send</Text>
+            <Ionicons name="sync-outline" size={20} color={colors.bgBase} />
+            <Text style={styles.primaryImportText}>Sync Inbox Messages</Text>
           </TouchableOpacity>
           
           <TouchableOpacity
-            style={styles.actionButton}
-            onPress={() => openQuickManualAdd("income")}
+            style={styles.secondaryImportButton}
+            onPress={() => setPasteModalVisible(true)}
           >
-            <Ionicons name="arrow-down" size={22} color={colors.statusIncome} />
-            <Text style={styles.actionText}>Receive</Text>
+            <Ionicons name="clipboard-outline" size={20} color={colors.accentPrimary} />
+            <Text style={styles.secondaryImportText}>Paste Statement</Text>
           </TouchableOpacity>
+        </View>
+
+        {/* Cashflow Outlook Card */}
+        <Text style={styles.sectionTitle}>Cashflow Outlook</Text>
+        <View style={styles.outlookCard}>
+          <View style={styles.outlookHeader}>
+            <Ionicons name="calendar-outline" size={18} color={colors.accentGold} style={{ marginRight: 6 }} />
+            <Text style={styles.outlookTitle}>Upcoming Recurring Bills</Text>
+          </View>
           
-          <TouchableOpacity style={styles.actionButton} onPress={handleSyncPress}>
-            <Ionicons name="phone-portrait-outline" size={22} color={colors.accentPrimary} />
-            <Text style={styles.actionText}>Sync SMS</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            style={styles.actionButton}
-            onPress={() => Alert.alert("Wallet", "Vault stores your mobile money balances locally.")}
-          >
-            <Ionicons name="wallet-outline" size={22} color={colors.accentGold} />
-            <Text style={styles.actionText}>Wallet</Text>
-          </TouchableOpacity>
+          {recurringBills.length === 0 ? (
+            <Text style={styles.outlookEmptyText}>No repeating monthly or weekly bills detected yet.</Text>
+          ) : (
+            recurringBills.slice(0, 3).map((bill, index) => (
+              <View key={index} style={styles.billRow}>
+                <View style={styles.billLeft}>
+                  <Text style={styles.billName}>{bill.title}</Text>
+                  <Text style={styles.billFrequency}>
+                    Due in {bill.daysLeft} day{bill.daysLeft !== 1 ? "s" : ""} ({bill.frequency})
+                  </Text>
+                </View>
+                <Text style={styles.billAmount}>-Ksh {formatAmount(bill.amount)}</Text>
+              </View>
+            ))
+          )}
+        </View>
+
+        {/* Till & Paybill Directory */}
+        <Text style={styles.sectionTitle}>Till & Paybill Directory</Text>
+        <View style={styles.directoryCard}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.directoryScroll}>
+            {utilityDirectory.paybills.length === 0 && utilityDirectory.tills.length === 0 ? (
+              <Text style={styles.directoryEmptyText}>No Paybill or Till transactions found in statement logs.</Text>
+            ) : null}
+
+            {/* Paybill List */}
+            {utilityDirectory.paybills.slice(0, 5).map((paybill, index) => (
+              <TouchableOpacity
+                key={`p-${index}`}
+                style={styles.directoryItem}
+                onPress={() => {
+                  const ussd = `*334*2*1*${paybill.number}*${paybill.account}#`;
+                  Alert.alert(
+                    "Quick Dial Info",
+                    `Paybill Number: ${paybill.number}\nAccount: ${paybill.account}\n\nRecommended Safaricom Quick Dial Code:\n${ussd}`,
+                    [
+                      { text: "Copy USSD Code", onPress: () => Clipboard.setStringAsync(ussd) },
+                      { text: "OK" }
+                    ]
+                  );
+                }}
+              >
+                <Ionicons name="card" size={20} color={colors.accentPrimary} />
+                <Text style={styles.directoryItemTitle} numberOfLines={1}>{paybill.name}</Text>
+                <Text style={styles.directoryItemSubtitle}>Paybill {paybill.number}</Text>
+              </TouchableOpacity>
+            ))}
+
+            {/* Till List */}
+            {utilityDirectory.tills.slice(0, 5).map((till, index) => (
+              <TouchableOpacity
+                key={`t-${index}`}
+                style={styles.directoryItem}
+                onPress={() => {
+                  const ussd = `*334*2*2*${till.number}#`;
+                  Alert.alert(
+                    "Quick Dial Info",
+                    `Till Number: ${till.number}\n\nRecommended Safaricom Quick Dial Code:\n${ussd}`,
+                    [
+                      { text: "Copy USSD Code", onPress: () => Clipboard.setStringAsync(ussd) },
+                      { text: "OK" }
+                    ]
+                  );
+                }}
+              >
+                <Ionicons name="cart" size={20} color={colors.accentGold} />
+                <Text style={styles.directoryItemTitle} numberOfLines={1}>{till.name}</Text>
+                <Text style={styles.directoryItemSubtitle}>Till {till.number}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
         </View>
 
         {/* Recent Transactions List */}
@@ -577,30 +732,39 @@ export default function HomeScreen({
               Forward or paste the incoming SMS text message below to auto-extract details:
             </Text>
 
-            <TextInput
-              style={styles.textAreaInput}
-              placeholder="Paste entire text message here..."
-              placeholderTextColor={colors.textMuted}
-              multiline={true}
-              numberOfLines={6}
-              value={pastedSms}
-              onChangeText={setPastedSms}
-            />
+            {aiParsing ? (
+              <View style={styles.modalLoadingContainer}>
+                <ActivityIndicator size="large" color={colors.accentPrimary} />
+                <Text style={styles.modalLoadingText}>AI Agent is extracting details...</Text>
+              </View>
+            ) : (
+              <>
+                <TextInput
+                  style={styles.textAreaInput}
+                  placeholder="Paste receipt SMS or type description..."
+                  placeholderTextColor={colors.textMuted}
+                  multiline={true}
+                  numberOfLines={6}
+                  value={pastedSms}
+                  onChangeText={setPastedSms}
+                />
 
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={styles.cancelButton}
-                onPress={() => setPasteModalVisible(false)}
-              >
-                <Text style={styles.cancelButtonText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.saveButton}
-                onPress={handlePasteParse}
-              >
-                <Text style={styles.saveButtonText}>Extract & Save</Text>
-              </TouchableOpacity>
-            </View>
+                <View style={styles.modalButtons}>
+                  <TouchableOpacity
+                    style={styles.cancelButton}
+                    onPress={() => setPasteModalVisible(false)}
+                  >
+                    <Text style={styles.cancelButtonText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.saveButton}
+                    onPress={handlePasteParse}
+                  >
+                    <Text style={styles.saveButtonText}>Extract & Save</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
           </View>
         </KeyboardAvoidingView>
       </Modal>
@@ -696,25 +860,42 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
     marginBottom: 12,
   },
-  actionsRow: {
+  importActionsContainer: {
     flexDirection: "row",
     justifyContent: "space-between",
     marginBottom: 28,
   },
-  actionButton: {
+  primaryImportButton: {
+    flexDirection: "row",
     alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.accentPrimary,
+    paddingVertical: 12,
+    borderRadius: 8,
+    width: "58%",
+  },
+  primaryImportText: {
+    fontFamily: "Nunito_700Bold",
+    color: colors.bgBase,
+    fontSize: 13,
+    marginLeft: 6,
+  },
+  secondaryImportButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
     backgroundColor: colors.bgElevated,
-    paddingVertical: 14,
-    borderRadius: 12,
     borderWidth: 1,
     borderColor: colors.borderHairline,
-    width: "22%",
+    paddingVertical: 12,
+    borderRadius: 8,
+    width: "38%",
   },
-  actionText: {
+  secondaryImportText: {
     fontFamily: "Nunito_600SemiBold",
-    color: colors.textPrimary,
-    fontSize: 11,
-    marginTop: 8,
+    color: colors.accentPrimary,
+    fontSize: 13,
+    marginLeft: 6,
   },
   dayGroup: {
     marginBottom: 20,
@@ -804,6 +985,17 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     padding: 20,
+  },
+  modalLoadingContainer: {
+    paddingVertical: 30,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalLoadingText: {
+    fontFamily: "Nunito_600SemiBold",
+    fontSize: 13,
+    color: colors.textMuted,
+    marginTop: 12,
   },
   modalContainer: {
     width: "100%",
@@ -966,5 +1158,108 @@ const styles = StyleSheet.create({
   },
   tabButtonTextActive: {
     color: colors.accentGold,
+  },
+  overdraftBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(194, 80, 46, 0.1)",
+    borderWidth: 1,
+    borderColor: colors.statusExpense,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 20,
+  },
+  overdraftBannerText: {
+    flex: 1,
+    fontFamily: "Nunito_600SemiBold",
+    fontSize: 12,
+    color: colors.statusExpense,
+    lineHeight: 16,
+  },
+  outlookCard: {
+    backgroundColor: colors.bgElevated,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.borderHairline,
+    padding: 16,
+    marginBottom: 24,
+  },
+  outlookHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 14,
+  },
+  outlookTitle: {
+    fontFamily: "BebasNeue_400Regular",
+    fontSize: 16,
+    color: colors.textPrimary,
+    letterSpacing: 0.5,
+  },
+  outlookEmptyText: {
+    fontFamily: "Nunito_400Regular",
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  billRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderHairline,
+    paddingVertical: 10,
+  },
+  billLeft: {
+    flex: 1,
+  },
+  billName: {
+    fontFamily: "Nunito_700Bold",
+    fontSize: 14,
+    color: colors.textPrimary,
+  },
+  billFrequency: {
+    fontFamily: "Nunito_400Regular",
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  billAmount: {
+    fontFamily: "DMMono_500Medium",
+    fontSize: 13,
+    color: colors.statusExpense,
+  },
+  directoryCard: {
+    marginBottom: 24,
+  },
+  directoryScroll: {
+    paddingRight: 16,
+  },
+  directoryEmptyText: {
+    fontFamily: "Nunito_400Regular",
+    fontSize: 12,
+    color: colors.textMuted,
+    marginLeft: 4,
+  },
+  directoryItem: {
+    backgroundColor: colors.bgElevated,
+    borderWidth: 1,
+    borderColor: colors.borderHairline,
+    borderRadius: 10,
+    padding: 12,
+    marginRight: 10,
+    width: 140,
+    alignItems: "flex-start",
+  },
+  directoryItemTitle: {
+    fontFamily: "Nunito_700Bold",
+    fontSize: 13,
+    color: colors.textPrimary,
+    marginTop: 8,
+    width: "100%",
+  },
+  directoryItemSubtitle: {
+    fontFamily: "DMMono_500Medium",
+    fontSize: 10,
+    color: colors.textMuted,
+    marginTop: 2,
   },
 });

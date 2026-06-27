@@ -60,6 +60,16 @@ export const parseMpesaSms = (body, smsId, smsDate, senderAddress = "") => {
     else if (senderUpper.includes("KCB")) defaultTitle = isIncome ? "KCB Deposit" : "KCB Debit";
     else if (senderUpper.includes("COOP")) defaultTitle = isIncome ? "Co-op Deposit" : "Co-op Debit";
 
+    // 5. Account Balance Extraction
+    const balRegex = /(?:ledger\s+balance|ledger\s+bal|ledger|balance|bal|available\s+bal|available\s+balance)(?:\s+is|:)?\s*(?:KES|Ksh)\s*([\d,]+\.\d{2})/i;
+    const balMatch = body.match(balRegex);
+    const mpesaBalance = balMatch ? parseFloat(balMatch[1].replace(/,/g, "")) : undefined;
+
+    // Check if it's a utility paybill inside bank alert
+    const paybillRegex = /(?:paybill|pay\s+bill)\s*(?:no\.?|to)?\s*(\d{5,7})/i;
+    const paybillMatch = body.match(paybillRegex);
+    const paybillNumber = paybillMatch ? paybillMatch[1] : undefined;
+
     return {
       confidence: refMatch ? "high" : "low",
       parsed: {
@@ -68,6 +78,8 @@ export const parseMpesaSms = (body, smsId, smsDate, senderAddress = "") => {
         amount: finalAmount,
         icon: isIncome ? "cash-outline" : "swap-horizontal",
         date: smsDate || Date.now(),
+        mpesaBalance: mpesaBalance,
+        paybill: paybillNumber,
         source: "sms",
       }
     };
@@ -140,10 +152,34 @@ export const parseMpesaSms = (body, smsId, smsDate, senderAddress = "") => {
     icon = "trending-up-outline";
   }
 
+  // Extract M-Pesa balance
+  const mpesaBalRegex = /M-PESA\s+balance\s+is\s+(?:KES|Ksh)\s*([\d,]+\.\d{2})/i;
+  const mpesaBalMatch = body.match(mpesaBalRegex);
+  const mpesaBalance = mpesaBalMatch ? parseFloat(mpesaBalMatch[1].replace(/,/g, "")) : undefined;
+
+  // Extract Ziidi balance (savings)
+  const ziidiBalRegex = /Ziidi\s+balance\s+is\s+(?:KES|Ksh)\s*([\d,]+\.\d{2})/i;
+  const ziidiBalMatch = body.match(ziidiBalRegex);
+  const ziidiBalance = ziidiBalMatch ? parseFloat(ziidiBalMatch[1].replace(/,/g, "")) : undefined;
+
   // Extract Fuliza outstanding balance if present
   const fulizaRegex = /(?:outstanding\s+)?Fuliza\s+balance\s+is\s+(?:KES|Ksh)\s*([\d,]+\.\d{2})/i;
   const fulizaMatch = body.match(fulizaRegex);
   const fulizaBalance = fulizaMatch ? parseFloat(fulizaMatch[1].replace(/,/g, "")) : undefined;
+
+  // Extract Paybill and Account numbers
+  const paybillRegex = /(?:paybill|pay\s+bill)\s*(?:no\.?|to)?\s*(\d{5,7})/i;
+  const paybillMatch = body.match(paybillRegex);
+  const paybillNumber = paybillMatch ? paybillMatch[1] : undefined;
+
+  const accountRegex = /account\s+(?:no\.?|number\s+)?([A-Z0-9_\-]+)/i;
+  const accountMatch = body.match(accountRegex);
+  const accountNumber = accountMatch ? accountMatch[1] : undefined;
+
+  // Extract Buy Goods Till Number
+  const tillRegex = /(?:till|buy\s+goods)\s*(?:no\.?|to)?\s*(\d{5,6})/i;
+  const tillMatch = body.match(tillRegex);
+  const tillNumber = tillMatch ? tillMatch[1] : undefined;
 
   const parsed = {
     id: transactionId,
@@ -152,7 +188,12 @@ export const parseMpesaSms = (body, smsId, smsDate, senderAddress = "") => {
     icon: icon,
     date: smsDate || Date.now(),
     isSavings: isSavings,
+    mpesaBalance: mpesaBalance,
+    ziidiBalance: ziidiBalance,
     fulizaBalance: fulizaBalance, // can be undefined
+    paybill: paybillNumber,
+    account: accountNumber,
+    till: tillNumber,
     source: "sms",
   };
 

@@ -16,7 +16,14 @@ import { Ionicons } from "@expo/vector-icons";
 import { colors } from "../theme/colors";
 import { storage } from "../utils/storage";
 
-export default function AiScreen({ transactions, budgets }) {
+export default function AiScreen({
+  transactions,
+  budgets,
+  reviewQueue = [],
+  onUpdateTransactions,
+  onUpdateReviewQueue,
+  onUpdateBudgets,
+}) {
   const [apiKey, setApiKey] = useState("");
   const [keyInput, setKeyInput] = useState("");
   const [isKeySaved, setIsKeySaved] = useState(false);
@@ -36,6 +43,10 @@ export default function AiScreen({ transactions, budgets }) {
   // Health Audit State
   const [auditReport, setAuditReport] = useState("");
   const [runningAudit, setRunningAudit] = useState(false);
+
+  // AI Agent Action States
+  const [runningAutoReview, setRunningAutoReview] = useState(false);
+  const [runningRecategorize, setRunningRecategorize] = useState(false);
 
   const chatScrollRef = useRef();
 
@@ -101,15 +112,15 @@ export default function AiScreen({ transactions, budgets }) {
       .filter((t) => t.amount < 0)
       .reduce((sum, t) => sum + Math.abs(t.amount), 0);
 
-    const totalBalance = totalIncome - totalExpenses;
-
-    const ziidiBalance = transactions
-      .filter((t) => t.isSavings || (t.title && t.title.toLowerCase().includes("ziidi")))
-      .reduce((sum, t) => sum - t.amount, 0);
-
+    // Latest actual balances
+    const latestMpesaTx = transactions.find((t) => t.mpesaBalance !== undefined);
+    const latestZiidiTx = transactions.find((t) => t.ziidiBalance !== undefined);
     const latestFulizaTx = transactions.find((t) => t.fulizaBalance !== undefined);
+
+    const mpesaCashBalance = latestMpesaTx ? latestMpesaTx.mpesaBalance : (totalIncome - totalExpenses);
+    const ziidiBalance = latestZiidiTx ? latestZiidiTx.ziidiBalance : 0;
     const fulizaBalance = latestFulizaTx ? latestFulizaTx.fulizaBalance : 0;
-    const netBalance = totalBalance + ziidiBalance - fulizaBalance;
+    const netBalance = mpesaCashBalance + ziidiBalance - fulizaBalance;
 
     // Group expenses by category
     const categorySpend = transactions
@@ -130,13 +141,22 @@ export default function AiScreen({ transactions, budgets }) {
 
     return {
       netBalance,
-      mpesaCash: totalBalance,
+      mpesaCash: mpesaCashBalance,
       ziidiBalance,
       fulizaBalance,
       categorySpend,
       budgets,
       recentTxSummary,
     };
+  };
+
+  const cleanJsonResponse = (rawText) => {
+    let clean = rawText.trim();
+    // Remove markdown code block wrapping if present
+    if (clean.startsWith("```")) {
+      clean = clean.replace(/^```[a-z]*\n/i, "").replace(/\n```$/i, "").trim();
+    }
+    return clean;
   };
 
   const handleSendChat = async () => {
@@ -177,6 +197,11 @@ Instructions:
 2. Answer the user's question directly using the balance figures, transactions, and budgets provided.
 3. Understand local features: "Fuliza" is an overdraft loan (negative balance), and "Ziidi" is Safaricom's investment/savings MMF product.
 4. Keep answers relatively concise and format with bullet points where appropriate. Do not repeat instructions.
+5. TOOL CALLING ACTIONS: If the user explicitly asks you to set a category budget or change the category of a transaction, you MUST append a JSON action block at the very end of your response inside |ACTION| brackets. Supported formats:
+- |ACTION|{"action":"recategorize","title":"NameOfMerchant","category":"icon-name"}|ACTION|
+- |ACTION|{"action":"set_budget","category":"icon-name","amount":number}|ACTION|
+
+Available icon-names: 'cart-outline', 'home-outline', 'logo-youtube', 'restaurant-outline', 'car-outline', 'gift-outline', 'send', 'wallet', 'trending-up-outline', 'swap-horizontal'.
 
 User's query: "${userMsg.text}"`;
 
@@ -194,7 +219,35 @@ User's query: "${userMsg.text}"`;
       );
 
       const json = await response.json();
-      const modelText = json.candidates?.[0]?.content?.parts?.[0]?.text || "I apologize, I could not process your query at this time. Please check your API key and connection.";
+      let modelText = json.candidates?.[0]?.content?.parts?.[0]?.text || "I apologize, I could not process your query at this time. Please check your API key and connection.";
+
+      // Check for |ACTION| block in model response
+      const actionRegex = /\|ACTION\|([\s\S]+?)\|ACTION\|/;
+      const actionMatch = modelText.match(actionRegex);
+      
+      if (actionMatch) {
+        try {
+          const actionData = JSON.parse(actionMatch[1]);
+          if (actionData.action === "recategorize") {
+            const updated = transactions.map((t) => {
+              if (t.title && t.title.toLowerCase().includes(actionData.title.toLowerCase())) {
+                return { ...t, icon: actionData.category };
+              }
+              return t;
+            });
+            onUpdateTransactions(updated);
+            Alert.alert("AI Action Executed", `Auto-corrected all transactions matching "${actionData.title}" to category "${actionData.category}".`);
+          } else if (actionData.action === "set_budget") {
+            const updatedBudgets = { ...budgets, [actionData.category]: actionData.amount };
+            onUpdateBudgets(updatedBudgets);
+            Alert.alert("AI Action Executed", `Successfully updated monthly limit for category "${actionData.category}" to Ksh ${actionData.amount}.`);
+          }
+          // Strip the action block from the visible chat bubble
+          modelText = modelText.replace(actionRegex, "").trim();
+        } catch (actionErr) {
+          console.error("AI Action parse failed:", actionErr);
+        }
+      }
 
       setChatMessages((prev) => [
         ...prev,
@@ -268,6 +321,172 @@ Keep it professional, direct, and formatting clean.`;
     }
   };
 
+  // AI Agent Action: Resolve Review Queue
+  const handleAutoReview = async () => {
+    if (reviewQueue.length === 0) {
+      Alert.alert("Empty Queue", "No transactions in the review queue to resolve.");
+      return;
+    }
+    setRunningAutoReview(true);
+
+    try {
+      const messagesToParse = reviewQueue.map((item) => ({
+        id: item.id,
+        body: item.body,
+        date: item.date,
+        sender: item.sender || "",
+      }));
+
+      const prompt = `You are a financial statement parsing engine. Read the following unparsed SMS messages and extract clean transaction details:
+${JSON.stringify(messagesToParse)}
+
+Parse each message and return a JSON array of objects. Each object MUST have this structure:
+{
+  "id": "A unique string ID matching the SMS ID provided",
+  "title": "A cleaned counterparty name (max 25 chars, e.g. 'James Maina')",
+  "amount": "A float number. Positive for credits/income, negative for debits/expenses",
+  "icon": "One of these matching the transaction category: 'cart-outline', 'home-outline', 'logo-youtube', 'restaurant-outline', 'car-outline', 'gift-outline', 'send', 'wallet', 'trending-up-outline', 'swap-horizontal'",
+  "date": "The timestamp provided in the SMS object (integer)",
+  "isSavings": "true if it is a savings/Ziidi transaction, false otherwise",
+  "mpesaBalance": "float if an M-Pesa balance is explicitly printed in the message, otherwise null",
+  "ziidiBalance": "float if a Ziidi balance is explicitly printed, otherwise null",
+  "fulizaBalance": "float if a Fuliza balance is explicitly printed, otherwise null"
+}
+
+IMPORTANT instructions:
+1. Return ONLY a valid JSON array. Do not include markdown code block syntax (like \`\`\`json) or any explanations. Return raw string starting with [ and ending with ].
+2. If a message cannot be parsed, omit it from the array.`;
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+          }),
+        }
+      );
+
+      const json = await response.json();
+      const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const cleaned = cleanJsonResponse(rawText);
+      const parsedItems = JSON.parse(cleaned);
+
+      if (Array.isArray(parsedItems) && parsedItems.length > 0) {
+        // Filter out duplicate IDs
+        const existingIds = new Set(transactions.map((t) => t.id));
+        const newTxs = parsedItems.filter((item) => !existingIds.has(item.id));
+
+        // Merge into transactions
+        const mergedTxs = [...newTxs, ...transactions];
+        onUpdateTransactions(mergedTxs);
+
+        // Remove from review queue
+        const parsedIds = new Set(parsedItems.map((item) => item.id));
+        const remainingQueue = reviewQueue.filter((item) => !parsedIds.has(item.id));
+        onUpdateReviewQueue(remainingQueue);
+
+        Alert.alert(
+          "AI Review Completed",
+          `AI successfully parsed and auto-resolved ${newTxs.length} transaction(s) from your review queue.`
+        );
+      } else {
+        Alert.alert("AI Review", "Gemini scanned the queue but could not extract any structured transactions.");
+      }
+    } catch (e) {
+      Alert.alert("Failed", "AI Auto-Review failed: " + e.message);
+    } finally {
+      setRunningAutoReview(false);
+    }
+  };
+
+  // AI Agent Action: Auto-Categorize Transactions
+  const handleAutoCategorize = async () => {
+    if (transactions.length === 0) {
+      Alert.alert("Empty", "No transactions found to re-categorize.");
+      return;
+    }
+    setRunningRecategorize(true);
+
+    try {
+      const txList = transactions.map((t) => ({
+        id: t.id,
+        title: t.title,
+        amount: t.amount,
+        icon: t.icon || "swap-horizontal",
+      }));
+
+      const prompt = `Review the following transaction names and their current categories (icons):
+${JSON.stringify(txList)}
+
+Your goal is to identify transactions that are generic ('swap-horizontal') or obviously miscategorized, and recommend the correct icon.
+Available icons are:
+- 'cart-outline' (Shopping, Supermarkets, general purchases, paybill, buy goods)
+- 'home-outline' (Rent, Electricity, KPLC, Water bills)
+- 'logo-youtube' (Subscriptions, Netflix, Spotify)
+- 'restaurant-outline' (Food, Dining, restaurants, coffee)
+- 'car-outline' (Transport, Uber, Bolt, Fuel, petrol)
+- 'gift-outline' (Gifts, donations)
+- 'send' (P2P transfers to individuals, sent to)
+- 'wallet' (Cash withdrawals)
+- 'trending-up-outline' (Savings, Ziidi MMF, investments)
+- 'swap-horizontal' (Other, fallback)
+
+Analyze the counterparties. If you recommend a correction, add it to your response.
+Return ONLY a valid JSON object mapping transaction ID to new icon name, for example:
+{
+  "TX_123": "cart-outline",
+  "TX_456": "home-outline"
+}
+
+Do not include markdown code block syntax (like \`\`\`json) or any explanations. Return raw string starting with { and ending with }.`;
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+          }),
+        }
+      );
+
+      const json = await response.json();
+      const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const cleaned = cleanJsonResponse(rawText);
+      const updates = JSON.parse(cleaned);
+
+      if (updates && typeof updates === "object" && Object.keys(updates).length > 0) {
+        let updateCount = 0;
+        const updatedTransactions = transactions.map((t) => {
+          if (updates[t.id] && updates[t.id] !== t.icon) {
+            updateCount++;
+            return { ...t, icon: updates[t.id] };
+          }
+          return t;
+        });
+
+        if (updateCount > 0) {
+          onUpdateTransactions(updatedTransactions);
+          Alert.alert(
+            "Recategorization Completed",
+            `AI scanned your records and auto-corrected categories for ${updateCount} transactions.`
+          );
+        } else {
+          Alert.alert("AI Categorizer", "All transactions seem to have appropriate categories. No changes needed!");
+        }
+      } else {
+        Alert.alert("AI Categorizer", "No modifications recommended by the AI categorizer.");
+      }
+    } catch (e) {
+      Alert.alert("Failed", "AI Recategorizer failed: " + e.message);
+    } finally {
+      setRunningRecategorize(false);
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
@@ -328,7 +547,7 @@ Keep it professional, direct, and formatting clean.`;
               onPress={() => setActiveSubTab("audit")}
             >
               <Text style={[styles.subTabButtonText, activeSubTab === "audit" && styles.subTabButtonTextActive]}>
-                Financial Audit
+                AI Agent Actions
               </Text>
             </TouchableOpacity>
           </View>
@@ -390,8 +609,64 @@ Keep it professional, direct, and formatting clean.`;
             </KeyboardAvoidingView>
           ) : (
             <ScrollView contentContainerStyle={styles.auditContent} showsVerticalScrollIndicator={false}>
+              
+              {/* AI Agent Action: Resolve Review Queue */}
+              <View style={styles.agentCard}>
+                <View style={styles.agentHeader}>
+                  <Ionicons name="construct-outline" size={24} color={colors.statusPending} />
+                  <Text style={styles.agentTitle}>AI Queue Assistant</Text>
+                </View>
+                <Text style={styles.agentText}>
+                  Parse un-resolved transaction statements sitting in your Review tab. Gemini will read the raw text and import them cleanly.
+                </Text>
+                <View style={styles.agentStatusRow}>
+                  <Text style={styles.agentStatusText}>
+                    Queued items: {reviewQueue.length}
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.agentButton, reviewQueue.length === 0 && styles.disabledButton]}
+                    onPress={handleAutoReview}
+                    disabled={reviewQueue.length === 0 || runningAutoReview}
+                  >
+                    {runningAutoReview ? (
+                      <ActivityIndicator size="small" color={colors.bgBase} />
+                    ) : (
+                      <Text style={styles.agentButtonText}>Resolve with AI</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* AI Agent Action: Recategorize Transactions */}
+              <View style={styles.agentCard}>
+                <View style={styles.agentHeader}>
+                  <Ionicons name="folder-open-outline" size={24} color={colors.accentGold} />
+                  <Text style={styles.agentTitle}>AI Smart Recategorizer</Text>
+                </View>
+                <Text style={styles.agentText}>
+                  Scan all transactions, map counterparties to appropriate categories, and auto-correct generic classification tags.
+                </Text>
+                <View style={styles.agentStatusRow}>
+                  <Text style={styles.agentStatusText}>
+                    Transactions logged: {transactions.length}
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.agentButton, transactions.length === 0 && styles.disabledButton]}
+                    onPress={handleAutoCategorize}
+                    disabled={transactions.length === 0 || runningRecategorize}
+                  >
+                    {runningRecategorize ? (
+                      <ActivityIndicator size="small" color={colors.bgBase} />
+                    ) : (
+                      <Text style={styles.agentButtonText}>Recategorize AI</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Spend Health Audit */}
               <View style={styles.auditHeroCard}>
-                <Ionicons name="analytics" size={48} color={colors.accentGold} />
+                <Ionicons name="analytics" size={32} color={colors.accentPrimary} />
                 <Text style={styles.auditTitle}>Spend Health Audit</Text>
                 <Text style={styles.auditSubtitle}>
                   Evaluate your current budgeting limits, analyze cash/overdraft ratios, and receive optimization coaching from Gemini.
@@ -633,20 +908,72 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 32,
   },
+  agentCard: {
+    backgroundColor: colors.bgElevated,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.borderHairline,
+    padding: 16,
+    marginBottom: 16,
+  },
+  agentHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  agentTitle: {
+    fontFamily: "BebasNeue_400Regular",
+    fontSize: 16,
+    color: colors.textPrimary,
+    marginLeft: 8,
+    letterSpacing: 0.5,
+  },
+  agentText: {
+    fontFamily: "Nunito_400Regular",
+    fontSize: 12,
+    color: colors.textMuted,
+    lineHeight: 16,
+    marginBottom: 12,
+  },
+  agentStatusRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  agentStatusText: {
+    fontFamily: "DMMono_500Medium",
+    fontSize: 11,
+    color: colors.textMuted,
+  },
+  agentButton: {
+    backgroundColor: colors.accentPrimary,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+  },
+  agentButtonText: {
+    color: colors.bgBase,
+    fontFamily: "Nunito_700Bold",
+    fontSize: 12,
+  },
+  disabledButton: {
+    opacity: 0.4,
+  },
   auditHeroCard: {
     backgroundColor: colors.bgElevated,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: colors.borderHairline,
-    padding: 24,
+    padding: 20,
     alignItems: "center",
-    marginBottom: 20,
+    marginBottom: 16,
+    marginTop: 8,
   },
   auditTitle: {
     fontFamily: "BebasNeue_400Regular",
-    fontSize: 22,
+    fontSize: 20,
     color: colors.textPrimary,
-    marginTop: 12,
+    marginTop: 8,
     letterSpacing: 0.5,
   },
   auditSubtitle: {
@@ -659,15 +986,15 @@ const styles = StyleSheet.create({
   },
   runAuditButton: {
     backgroundColor: colors.accentPrimary,
-    paddingVertical: 12,
-    paddingHorizontal: 28,
+    paddingVertical: 10,
+    paddingHorizontal: 24,
     borderRadius: 8,
-    marginTop: 18,
+    marginTop: 14,
   },
   runAuditButtonText: {
     color: colors.bgBase,
     fontFamily: "Nunito_700Bold",
-    fontSize: 14,
+    fontSize: 13,
   },
   reportCard: {
     backgroundColor: colors.bgElevated,
