@@ -5,9 +5,12 @@ const { withMainApplication } = require('@expo/config-plugins');
 const withSmsModule = (config) => {
   return withMainApplication(config, (modConfig) => {
     const projectRoot = modConfig.modRequest.projectRoot;
+    const packageName = config.android?.package || 'com.usersapp';
+    const packagePath = packageName.replace(/\./g, '/');
     const destDir = path.join(
       projectRoot,
-      'android/app/src/main/java/com/usersapp'
+      'android/app/src/main/java',
+      packagePath
     );
 
     if (!fs.existsSync(destDir)) {
@@ -15,7 +18,7 @@ const withSmsModule = (config) => {
     }
 
     // SmsModule.kt
-    const smsModuleContent = `package com.usersapp
+    const smsModuleContent = `package ${packageName}
 
 import android.content.Context
 import android.database.Cursor
@@ -71,7 +74,7 @@ class SmsModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMod
 }`;
 
     // SmsPackage.kt
-    const smsPackageContent = `package com.usersapp
+    const smsPackageContent = `package ${packageName}
 
 import com.facebook.react.ReactPackage
 import com.facebook.react.bridge.NativeModule
