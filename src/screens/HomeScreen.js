@@ -17,6 +17,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { colors } from "../theme/colors";
 import { parseMpesaSms } from "../utils/parser";
+import { classifyTransaction } from "../utils/classifier";
 
 const AVAILABLE_ICONS = [
   "cart-outline",
@@ -158,6 +159,12 @@ export default function HomeScreen({
       );
     } else {
       // Success adding transaction
+      if (parsed.amount < 0) {
+        const mlIcon = classifyTransaction(parsed.title, transactions);
+        if (mlIcon) {
+          parsed.icon = mlIcon;
+        }
+      }
       onAddTransaction(parsed);
       Alert.alert("Success", `Parsed: ${parsed.title} for Ksh ${Math.abs(parsed.amount)}`);
     }

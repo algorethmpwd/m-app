@@ -19,7 +19,8 @@
     "android": {
       "package": "com.mapp",
       "permissions": [
-        "android.permission.READ_SMS"
+        "android.permission.READ_SMS",
+        "android.permission.RECEIVE_SMS"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/logo.png",

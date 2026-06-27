@@ -23,6 +23,7 @@ import { DMMono_500Medium } from "@expo-google-fonts/dm-mono";
 import { colors } from "./src/theme/colors";
 import { storage } from "./src/utils/storage";
 import { parseMpesaSms } from "./src/utils/parser";
+import { classifyTransaction } from "./src/utils/classifier";
 import OnboardingScreen from "./src/screens/OnboardingScreen";
 import LockScreen from "./src/screens/LockScreen";
 import HomeScreen from "./src/screens/HomeScreen";
@@ -32,6 +33,8 @@ import SettingsScreen from "./src/screens/SettingsScreen";
 
 // Native SMS Module Bridge
 import { NativeModules } from "react-native";
+import * as FileSystem from "expo-file-system";
+import * as Clipboard from "expo-clipboard";
 const { SmsModule } = NativeModules;
 
 export default function App() {
@@ -60,6 +63,128 @@ export default function App() {
   // AppState monitoring for background lock
   const appState = useRef(AppState.currentState);
 
+  const importBackgroundQueuedSyncs = async (currentTransactions) => {
+    try {
+      const queueUri = FileSystem.documentDirectory + "pending_background_syncs.json";
+      const fileInfo = await FileSystem.getInfoAsync(queueUri);
+      
+      if (!fileInfo.exists) {
+        return;
+      }
+
+      const fileContent = await FileSystem.readAsStringAsync(queueUri);
+      const queuedMessages = JSON.parse(fileContent);
+
+      if (!Array.isArray(queuedMessages) || queuedMessages.length === 0) {
+        await FileSystem.deleteAsync(queueUri, { idempotent: true });
+        return;
+      }
+
+      const parsedTxs = [];
+      const reviewItems = [];
+      const existingTxIds = new Set(currentTransactions.map((t) => t.id));
+
+      queuedMessages.forEach((msg) => {
+        const { confidence, parsed } = parseMpesaSms(msg.body, msg.id, msg.date, msg.address);
+
+        if (confidence === "high" && parsed) {
+          if (!existingTxIds.has(parsed.id)) {
+            if (parsed.amount < 0) {
+              const mlIcon = classifyTransaction(parsed.title, currentTransactions);
+              if (mlIcon) {
+                parsed.icon = mlIcon;
+              }
+            }
+            parsedTxs.push(parsed);
+            existingTxIds.add(parsed.id);
+          }
+        } else if (confidence === "low" || confidence === "none") {
+          reviewItems.push({
+            id: msg.id || "R_" + Date.now() + Math.random(),
+            body: msg.body,
+            date: msg.date || Date.now(),
+            sender: msg.address,
+          });
+        }
+      });
+
+      let updatedTxs = [...currentTransactions];
+      if (parsedTxs.length > 0) {
+        updatedTxs = [...parsedTxs, ...currentTransactions];
+        setTransactions(updatedTxs);
+        await storage.saveTransactions(updatedTxs);
+      }
+
+      if (reviewItems.length > 0) {
+        const updatedReview = [...reviewItems, ...reviewQueue];
+        setReviewQueue(updatedReview);
+        await storage.saveReviewQueue(updatedReview);
+      }
+
+      await FileSystem.deleteAsync(queueUri, { idempotent: true });
+
+      if (parsedTxs.length > 0) {
+        Alert.alert(
+          "Auto-Sync Completed",
+          `Auto-imported ${parsedTxs.length} transaction(s) received in the background.`
+        );
+      }
+    } catch (error) {
+      console.error("Error importing background syncs:", error);
+    }
+  };
+
+  const checkClipboardForReceipts = async (currentTransactions) => {
+    try {
+      const hasString = await Clipboard.hasStringAsync();
+      if (!hasString) return;
+
+      const clipboardContent = await Clipboard.getStringAsync();
+      if (!clipboardContent) return;
+
+      const contentTrimmed = clipboardContent.trim();
+      const bodyLower = contentTrimmed.toLowerCase();
+      
+      const isMpesa = bodyLower.includes("mpesa") || bodyLower.includes("m-pesa");
+      const isBank = bodyLower.includes("equity") || bodyLower.includes("kcb alert") || bodyLower.includes("co-op bank") || bodyLower.includes("debited") || bodyLower.includes("credited");
+
+      if (isMpesa || isBank) {
+        const { confidence, parsed } = parseMpesaSms(contentTrimmed, "C_" + Date.now(), Date.now());
+        
+        if (parsed) {
+          const exists = currentTransactions.some((t) => t.id === parsed.id);
+          if (exists) return;
+
+          Alert.alert(
+            "Transaction Detected in Clipboard",
+            `We found a statement for Ksh ${Math.abs(parsed.amount)} (${parsed.title}) in your clipboard. Import it?`,
+            [
+              { text: "Dismiss" },
+              {
+                text: "Import",
+                onPress: async () => {
+                  if (parsed.amount < 0) {
+                    const mlIcon = classifyTransaction(parsed.title, currentTransactions);
+                    if (mlIcon) {
+                      parsed.icon = mlIcon;
+                    }
+                  }
+                  const updatedTxs = [parsed, ...currentTransactions];
+                  setTransactions(updatedTxs);
+                  await storage.saveTransactions(updatedTxs);
+                  await Clipboard.setStringAsync("");
+                  Alert.alert("Success", "Imported transaction successfully.");
+                }
+              }
+            ]
+          );
+        }
+      }
+    } catch (error) {
+      console.log("Error checking clipboard:", error);
+    }
+  };
+
   // 1. Initial Data Loading
   useEffect(() => {
     const loadAppData = async () => {
@@ -74,6 +199,7 @@ export default function App() {
           const savedSettings = await storage.getSettings();
           const savedPin = await storage.getPin();
 
+          const currentTxs = savedTx || [];
           if (savedTx) setTransactions(savedTx);
           if (savedBudgets) setBudgets(savedBudgets);
           if (savedReview) setReviewQueue(savedReview);
@@ -83,6 +209,9 @@ export default function App() {
             setIntakeMethod(savedSettings.intakeMethod || "paste");
             setReminderTime(savedSettings.reminderTime || { hour: 20, minute: 0 });
           }
+
+          await importBackgroundQueuedSyncs(currentTxs);
+          await checkClipboardForReceipts(currentTxs);
         }
       } catch (err) {
         console.error("Failed to load local app database:", err);
@@ -93,7 +222,7 @@ export default function App() {
 
   // 2. Enforce lock on resume
   useEffect(() => {
-    const handleAppStateChange = (nextAppState) => {
+    const handleAppStateChange = async (nextAppState) => {
       if (
         appState.current.match(/inactive|background/) &&
         nextAppState === "active"
@@ -102,6 +231,10 @@ export default function App() {
         if (pin) {
           setIsLocked(true);
         }
+
+        const currentTxList = await storage.getTransactions() || [];
+        await importBackgroundQueuedSyncs(currentTxList);
+        await checkClipboardForReceipts(currentTxList);
       }
       appState.current = nextAppState;
     };
@@ -147,19 +280,20 @@ export default function App() {
     }
 
     try {
-      const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_SMS);
-      if (!hasPermission) {
-        const granted = await PermissionsAndroid.request(
+      const hasRead = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_SMS);
+      const hasReceive = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECEIVE_SMS);
+
+      if (!hasRead || !hasReceive) {
+        const results = await PermissionsAndroid.requestMultiple([
           PermissionsAndroid.PERMISSIONS.READ_SMS,
-          {
-            title: "SMS Read Permission Required",
-            message: "Vault requires SMS read permission to automatically scan M-Pesa transaction receipts.",
-            buttonPositive: "Grant",
-            buttonNegative: "Deny",
-          }
-        );
-        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-          Alert.alert("Permission Denied", "SMS synchronization cannot run without SMS read permissions.");
+          PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
+        ]);
+        
+        const readGranted = results[PermissionsAndroid.PERMISSIONS.READ_SMS] === PermissionsAndroid.RESULTS.GRANTED;
+        const receiveGranted = results[PermissionsAndroid.PERMISSIONS.RECEIVE_SMS] === PermissionsAndroid.RESULTS.GRANTED;
+
+        if (!readGranted) {
+          Alert.alert("Permission Denied", "SMS synchronization and real-time alerts require SMS permissions.");
           return;
         }
       }
@@ -176,16 +310,26 @@ export default function App() {
 
       messages.forEach((msg) => {
         const sender = msg.address ? msg.address.toUpperCase() : "";
-        if (sender.includes("MPESA") || sender.includes("M-PESA")) {
-          const { confidence, parsed } = parseMpesaSms(msg.body, msg.id, msg.date);
+        const isMpesa = sender.includes("MPESA") || sender.includes("M-PESA");
+        const isBank = sender.includes("EQUITY") || sender.includes("EQUITEL") || sender.includes("KCB") || sender.includes("COOP") || sender.includes("NCBA") || sender.includes("ABSA");
+
+        if (isMpesa || isBank) {
+          const { confidence, parsed } = parseMpesaSms(msg.body, msg.id, msg.date, msg.address);
           
           if (confidence === "high" && parsed) {
+            if (parsed.amount < 0) {
+              const mlIcon = classifyTransaction(parsed.title, transactions);
+              if (mlIcon) {
+                parsed.icon = mlIcon;
+              }
+            }
             parsedTxs.push(parsed);
           } else if (confidence === "low" || confidence === "none") {
             reviewItems.push({
               id: msg.id || "R_" + Date.now() + Math.random(),
               body: msg.body,
               date: msg.date || Date.now(),
+              sender: msg.address,
             });
           }
         }

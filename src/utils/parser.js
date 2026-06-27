@@ -1,11 +1,81 @@
-// Parser function to extract M-Pesa details from SMS body
-export const parseMpesaSms = (body, smsId, smsDate) => {
-  // Examples of standard M-Pesa messages:
-  // ABC123DEF4 Confirmed. Ksh100.00 sent to John Doe 0712345678 on 24/6/26 at 3:00 PM.
-  // ABC123DEF5 Confirmed. Ksh250.00 paid to KPLC.
-  // ABC123DEF6 Confirmed. You have received Ksh1,000.00 from Jane Doe.
-  // Fuliza M-PESA: You have successfully used an overdraft of KES 200.00 to pay Grace Wanjiku. Your outstanding Fuliza balance is KES 200.00. Transaction ID: ABC123DEF7.
+// Parser function to extract M-Pesa or Bank details from SMS body
+export const parseMpesaSms = (body, smsId, smsDate, senderAddress = "") => {
+  const bodyLower = body.toLowerCase();
+  const senderUpper = senderAddress ? senderAddress.toUpperCase() : "";
 
+  // Check if it's a bank alert (Equity, KCB, Co-op, ABSA, NCBA, etc.)
+  const isBank = 
+    senderUpper.includes("EQUITY") || 
+    senderUpper.includes("EQUITEL") || 
+    senderUpper.includes("KCB") || 
+    senderUpper.includes("COOP") || 
+    senderUpper.includes("NCBA") || 
+    senderUpper.includes("ABSA") || 
+    bodyLower.includes("equity bank") || 
+    bodyLower.includes("kcb alert") || 
+    bodyLower.includes("co-op bank");
+
+  if (isBank) {
+    // 1. Amount Extraction
+    const amountRegex = /(?:Ksh|KES)\s*([\d,]+\.\d{2})/i;
+    const amountMatch = body.match(amountRegex);
+    if (!amountMatch) {
+      return { confidence: "none", parsed: null };
+    }
+    const parsedAmount = parseFloat(amountMatch[1].replace(/,/g, ""));
+
+    // 2. Direction Extraction (Debited/Sent -> Expense, Credited/Received -> Income)
+    const isIncome = 
+      bodyLower.includes("credited") || 
+      bodyLower.includes("received") || 
+      bodyLower.includes("deposited") || 
+      bodyLower.includes("inward");
+    const finalAmount = isIncome ? parsedAmount : -parsedAmount;
+
+    // 3. Transaction ID Extraction
+    const refRegex = /(?:ref|reference|txn|transaction|id)(?:\s+no\.?|:|\s+)?\s*([A-Z0-9]+)/i;
+    const refMatch = body.match(refRegex);
+    const transactionId = refMatch ? refMatch[1] : (smsId || "B_" + Date.now());
+
+    // 4. Counterparty Name Extraction
+    let title = "";
+    if (isIncome) {
+      const fromMatch = body.match(/from\s+(.+?)(?=\s+\d{9,12}|\s+on\s+|\s+A\/C|\.|$)/i);
+      if (fromMatch) title = fromMatch[1].trim();
+    } else {
+      const toMatch = body.match(/to\s+(.+?)(?=\s+\d{9,12}|\s+on\s+|\s+A\/C|\.|$)/i);
+      const paidMatch = body.match(/paid\s+(.+?)(?=\s+\d{9,12}|\s+on\s+|\s+A\/C|\.|$)/i);
+      if (toMatch) title = toMatch[1].trim();
+      else if (paidMatch) title = paidMatch[1].trim();
+    }
+
+    // Cleaning and formatting title
+    title = title.replace(/\s+\d{10}.*$/, "").replace(/\.$/, "").trim();
+    if (title.length > 30) {
+      title = title.substring(0, 30) + "...";
+    }
+
+    let defaultTitle = "Bank Transfer";
+    if (senderUpper.includes("EQUITY")) defaultTitle = isIncome ? "Equity Deposit" : "Equity Debit";
+    else if (senderUpper.includes("KCB")) defaultTitle = isIncome ? "KCB Deposit" : "KCB Debit";
+    else if (senderUpper.includes("COOP")) defaultTitle = isIncome ? "Co-op Deposit" : "Co-op Debit";
+
+    return {
+      confidence: refMatch ? "high" : "low",
+      parsed: {
+        id: transactionId,
+        title: title || defaultTitle,
+        amount: finalAmount,
+        icon: isIncome ? "cash-outline" : "swap-horizontal",
+        date: smsDate || Date.now(),
+        source: "sms",
+      }
+    };
+  }
+
+  // -------------------------------------------------------------
+  // M-Pesa Parsing Flow
+  // -------------------------------------------------------------
   const idRegex = /^([A-Z0-9]{10})\s+Confirmed/i;
   const fulizaTxRegex = /Transaction\s+ID:\s*([A-Z0-9]{10})/i;
   const amountRegex = /(?:Ksh|KES)\s*([\d,]+\.\d{2})/i;
@@ -14,7 +84,6 @@ export const parseMpesaSms = (body, smsId, smsDate) => {
   const fulizaTxMatch = body.match(fulizaTxRegex);
   const amountMatch = body.match(amountRegex);
   
-  // If we can't find an amount, parsing fails completely
   if (!amountMatch) {
     return { confidence: "none", parsed: null };
   }
@@ -22,18 +91,15 @@ export const parseMpesaSms = (body, smsId, smsDate) => {
   const transactionId = idMatch ? idMatch[1] : (fulizaTxMatch ? fulizaTxMatch[1] : smsId);
   const parsedAmount = parseFloat(amountMatch[1].replace(/,/g, ""));
   
-  const bodyLower = body.toLowerCase();
   const isIncome = bodyLower.includes("received") || bodyLower.includes("received from");
   const finalAmount = isIncome ? parsedAmount : -parsedAmount;
 
   // Extract sender or recipient name
   let title = "";
   if (isIncome) {
-    // Match name, stopping at phone number (9-12 digits), the word "on", period, or end of line
     const fromMatch = body.match(/from\s+(.+?)(?=\s+\d{9,12}|\s+\bon\b|\.|$)/i);
     if (fromMatch) title = fromMatch[1].trim();
   } else {
-    // Check multiple patterns
     const paidMatch = body.match(/paid\s+to\s+(.+?)(?=\s+\d{9,12}|\s+\bon\b|\.|$)/i);
     const toMatch = body.match(/sent\s+to\s+(.+?)(?=\s+\d{9,12}|\s+\bon\b|\.|$)/i);
     const boughtMatch = body.match(/bought\s+for\s+(.+?)(?=\s+\d{9,12}|\s+\bon\b|\.|$)/i);
@@ -47,13 +113,13 @@ export const parseMpesaSms = (body, smsId, smsDate) => {
     else if (withdrawnMatch) title = withdrawnMatch[1].trim();
   }
 
-  // Clean title (remove trailing dot/newlines/numbers/special chars)
+  // Clean title
   title = title.replace(/\s+\d{10}.*$/, "").replace(/\.$/, "").trim();
   if (title.length > 30) {
     title = title.substring(0, 30) + "...";
   }
 
-  // Dynamic icon selection
+  // Icon Selection
   let icon = "swap-horizontal";
   const titleLower = title.toLowerCase();
   
@@ -69,7 +135,6 @@ export const parseMpesaSms = (body, smsId, smsDate) => {
     }
   }
 
-  // Specific categorizations
   const isSavings = titleLower.includes("ziidi");
   if (isSavings) {
     icon = "trending-up-outline";
@@ -91,7 +156,6 @@ export const parseMpesaSms = (body, smsId, smsDate) => {
     source: "sms",
   };
 
-  // Confidence is high if we have a valid 10-char M-Pesa transaction ID
   const confidence = (idMatch || fulizaTxMatch) ? "high" : "low";
 
   return { confidence, parsed };
