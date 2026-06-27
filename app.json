@@ -4,13 +4,13 @@
     "slug": "m-app",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/logo.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/logo.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0E0D0C"
     },
     "ios": {
       "supportsTablet": true,
@@ -22,8 +22,8 @@
         "android.permission.READ_SMS"
       ],
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "foregroundImage": "./assets/logo.png",
+        "backgroundColor": "#0E0D0C"
       },
       "edgeToEdgeEnabled": true
     },
@@ -34,6 +34,11 @@
       "expo-font",
       "expo-secure-store",
       "./plugins/withSmsModule"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2b4786c1-515e-4e2b-a57b-b0c2b67c861f"
+      }
+    }
   }
 }
