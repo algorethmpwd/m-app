@@ -17,6 +17,9 @@ const CATEGORY_META = {
   "restaurant-outline": { label: "Food & Dining", color: "#f59e0b" },
   "car-outline": { label: "Transport", color: "#06b6d4" },
   "gift-outline": { label: "Gifts", color: "#ec4899" },
+  "send": { label: "Send Money", color: "#f97316" },
+  "wallet": { label: "Withdrawals", color: "#14b8a6" },
+  "trending-up-outline": { label: "Savings & Investment", color: "#10b981" },
   "swap-horizontal": { label: "Other", color: "#64748b" },
 };
 
@@ -89,7 +92,7 @@ export default function InsightsScreen({ transactions, budgets, onDeleteTransact
                           styles.barFill,
                           {
                             height: Math.max(barHeight, 4),
-                            backgroundColor: isActive ? colors.accentGold : colors.accentEmber,
+                            backgroundColor: isActive ? colors.accentGold : (meta.color || colors.accentEmber),
                           },
                         ]}
                       />

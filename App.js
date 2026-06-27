@@ -170,7 +170,7 @@ export default function App() {
 
     setSyncing(true);
     try {
-      const messages = await SmsModule.getSmsList(50); // Fetch recent 50
+      const messages = await SmsModule.getSmsList(2000); // Fetch recent 2000
       const parsedTxs = [];
       const reviewItems = [];
 
