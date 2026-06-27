@@ -151,6 +151,8 @@ import android.content.Intent
 import android.provider.Telephony
 import android.util.Log
 import java.io.File
+import java.util.Locale
+import java.util.Random
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -158,29 +160,31 @@ class SmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION) {
             val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
-            for (message in messages) {
-                val body = message.messageBody
-                val sender = message.originatingAddress ?: ""
-                val senderUpper = sender.toUpperCase()
-                val date = message.timestampMillis
+            if (messages != null) {
+                for (message in messages) {
+                    val body = message.messageBody
+                    val sender = message.originatingAddress ?: ""
+                    val senderUpper = sender.uppercase(Locale.US)
+                    val date = message.timestampMillis
 
-                val isMpesa = senderUpper.contains("MPESA") || senderUpper.contains("M-PESA")
-                val isBank = senderUpper.contains("EQUITY") || senderUpper.contains("EQUITEL") || 
-                             senderUpper.contains("KCB") || senderUpper.contains("COOP") || 
-                             senderUpper.contains("NCBA") || senderUpper.contains("ABSA")
+                    val isMpesa = senderUpper.contains("MPESA") || senderUpper.contains("M-PESA")
+                    val isBank = senderUpper.contains("EQUITY") || senderUpper.contains("EQUITEL") || 
+                                 senderUpper.contains("KCB") || senderUpper.contains("COOP") || 
+                                 senderUpper.contains("NCBA") || senderUpper.contains("ABSA")
 
-                if (isMpesa || isBank) {
-                    Log.d("SmsReceiver", "Real-time sync: transactional SMS from $sender")
-                    
-                    // Queue SMS to local pending background syncs file
-                    savePendingSms(context, body, sender, date)
-                    
-                    // Trigger native local push notification
-                    NotificationHelper.showNotification(
-                        context,
-                        "Sync Complete",
-                        "A new transactional statement was auto-imported."
-                    )
+                    if (isMpesa || isBank) {
+                        Log.d("SmsReceiver", "Real-time sync: transactional SMS from $sender")
+                        
+                        // Queue SMS to local pending background syncs file
+                        savePendingSms(context, body, sender, date)
+                        
+                        // Trigger native local push notification
+                        NotificationHelper.showNotification(
+                            context,
+                            "Sync Complete",
+                            "A new transactional statement was auto-imported."
+                        )
+                    }
                 }
             }
         }
@@ -195,11 +199,12 @@ class SmsReceiver : BroadcastReceiver() {
                 JSONArray()
             }
 
+            val randomVal = Random().nextInt(900) + 100
             val obj = JSONObject()
             obj.put("body", body)
             obj.put("address", sender)
             obj.put("date", date)
-            obj.put("id", "BG_" + System.currentTimeMillis() + "_" + (100..999).random())
+            obj.put("id", "BG_" + System.currentTimeMillis() + "_" + randomVal)
             array.put(obj)
 
             file.writeText(array.toString())
@@ -233,7 +238,7 @@ object NotificationHelper {
             notificationManager.createNotificationChannel(channel)
         }
 
-        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: Intent()
         val pendingIntent = PendingIntent.getActivity(
             context,
             0,
@@ -264,11 +269,16 @@ object NotificationHelper {
 
     let contents = modConfig.modResults.contents;
 
-    if (!contents.includes('add(SmsPackage())')) {
+    // Clean up any un-fully-qualified package registration from previous builds
+    if (contents.includes('add(SmsPackage())')) {
+      contents = contents.replace('add(SmsPackage())', `add(${packageName}.SmsPackage())`);
+    }
+
+    if (!contents.includes(`add(${packageName}.SmsPackage())`)) {
       const target = 'PackageList(this).packages.apply {';
       contents = contents.replace(
         target,
-        `${target}\n              add(SmsPackage())`
+        `${target}\n              add(${packageName}.SmsPackage())`
       );
     }
 
